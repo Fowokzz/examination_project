@@ -1,0 +1,263 @@
+---
+- name: LAMP setup
+  gather_facts: false
+  hosts: all
+
+  tasks:
+    - name: Update package manager
+      apt: update_cache=yes
+
+    - name: Upgrade System
+      apt: upgrade=dist update_cache=yes      
+
+    - name: Install UFW
+      apt: name=ufw state=latest 
+
+    - name: Set SSH rule 
+      community.general.ufw: rule=allow name=OpenSSH
+
+    - name: UFW - Allow HTTP on port 80 
+      community.general.ufw: rule=allow port='80' proto=tcp
+
+    - name: UFW - Allow HTTPS on port 443 
+      community.general.ufw: rule=allow port='443' proto=tcp   
+
+#Apache Configuration
+    - name: Install LAMP Packages
+      apt: name={{ item }} update_cache=yes state=latest
+      loop: [ 'apache2', 'python3-pymysql' ]
+
+    - name: Create document root
+      file:
+        path: /var/www/
+        state: directory
+        owner: www-data
+        mode: '0755'
+
+    - name: Set up Apache virtualhost
+      template:
+        src: ~/ansible/laravel.conf
+        dest: /etc/apache2/sites-available/laravel.conf
+      notify: Reload Apache2
+
+    - name: Enable new site
+      command: a2ensite laravel.conf
+      notify: Reload Apache2    
+
+    - name: Disable default Apache site
+      shell: /usr/sbin/a2dissite 000-default.conf
+      when: true
+      notify: Reload Apache2
+
+    - name: Download MariaDB repo
+      ansible.builtin.get_url:
+        url: https://downloads.mariadb.com/MariaDB/mariadb_repo_setup
+        dest: /home/adefowoke/.ansible/tmp/mariadb_repo_setup
+
+    - name: Setup version 10.7
+      ansible.builtin.command:
+        cmd: bash /home/adefowoke/.ansible/tmp/mariadb_repo_setup --mariadb-server-version=10.7
+      become: yes
+
+    - name: Install MariaDB
+      ansible.builtin.apt: name={{item}} state=present
+      with_items:
+          - mariadb-client
+          - mariadb-common
+          - mariadb-server
+      become: yes
+
+    - name: Install dependency
+      ansible.builtin.apt: state=MySQL-python3 state=present
+
+    - name: Start MariaDB
+      service: 
+        name: mariadb
+        enabled: yes
+        state: started
+
+    - name: Create App Database
+      mysql_db:
+        login_unix_socket: /var/run/mysqld/mysqld.sock 
+        name: examination
+        state: present
+
+    - name: Create MySQL User
+      mysql_user:
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        name: adefowoke
+        password: miniproject2
+        priv: 'examination.*:ALL'
+        host: localhost
+        state: present 
+
+    - name: Repo PHP
+      apt_repository: repo="ppa:ondrej/php"
+
+    - name: Updating The Repo
+      apt: update_cache=yes
+
+    - name: Installing PHP and It's Dependencies
+      apt:
+        name: "{{item}}"
+        state: latest
+        update_cache: true
+      loop:
+        - php8.1
+        - libapache2-mod-php
+        - php8.1-mysql
+        - php8.1-common
+        - php8.1-xml
+        - php8.1-fpm
+        - php8.1-xmlrpc
+        - php8.1-curl
+        - php8.1-gd
+        - php8.1-imagick
+        - php8.1-cli
+        - php8.1-dev
+        - php8.1-imap
+        - php8.1-mbstring
+        - php8.1-soap
+        - php8.1-zip
+        - php8.1-intl
+        - php8.1-bcmath
+        - unzip
+
+    - name: "Read Checksum"
+      shell: curl https://getcomposer.org/download/latest-stable/composer.phar.sha256
+      register: composer_checksum
+
+    - name: "Download PHAR file"
+      ansible.builtin.get_url:
+        url: https://getcomposer.org/download/latest-stable/composer.phar
+        dest: /usr/local/bin/composer
+        mode: '0755'
+        force: yes
+        checksum: "sha256:{{ composer_checksum.stdout }}"
+      become: yes
+
+    - name: set permissions for composer file
+      file:
+        path: /usr/local/bin/composer
+        mode: a+x
+        state: file
+        owner: root                  
+
+    - name: Add Composer to global path
+      copy: 
+        src: /usr/local/bin/composer
+        group: root
+        mode: '0755'
+        owner: root
+        dest: /usr/src/composer.phar
+        remote_src: yes
+      become: yes
+
+    - name: Clone laravel repository
+      git:
+        repo: https://github.com/f1amy/laravel-realworld-example-app.git
+        dest: /var/www/laravel
+        clone: yes
+        update: yes
+      become: yes   
+
+    - name: install laravel dependencies
+      shell: composer install
+      args:
+        chdir: /var/www/laravel
+      become: false
+
+    - name: take ownership of laravel folder
+      file:
+        path: /var/www/laravel/
+        owner: adefowoke
+        group: www-data
+        mode: '0775'
+        recurse: yes
+      become: yes
+    
+    - name: set permissions for Laravel storage folder
+      file:
+        path: /var/www/laravel/storage
+        state: directory
+        recurse: yes
+        owner: adefowoke
+        group: www-data
+        mode: '0775'
+      become: yes
+
+    - name: set permissions for bootstrap folder
+      file:
+        path: /var/www/laravel/bootsrap/cache
+        state: directory
+        owner: adefowoke
+        group: www-data
+        recurse: yes
+        mode: '0775'
+      become: yes      
+
+    - name: copy env file
+      copy:
+        src: ~/ansible/.env.example
+        dest: /var/www/laravel/.env
+        owner: adefowoke
+        group: www-data
+        mode: '0775'
+      become: yes
+
+    - name: setup laravel
+      shell: |
+         cd /var/www/laravel
+         php artisan key:generate
+         php artisan migrate --force
+         php artisan db:seed
+         php artisan optimize
+         php artisan config:clear
+         php artisan cache:clear   
+
+    - name: Install Certbot's apache package
+      apt:
+        name: python3-certbot-apache
+        state: present
+
+    - name: Check if certificate already exists.
+      stat:
+        path: /etc/letsencrypt/live/adefowokeoluwole.me/cert.pem
+      register: letsencrypt_cert
+      with_items:
+        - {servername: adefowokeoluwole.me, serveralias: www.adefowokeoluwole.me, documentroot: /var/www/laravel/public}
+
+    - name: Stop apache services to allow certbot to generate a certificate
+      service:
+        name: apache2
+        state: stopped
+
+    - name: Generate new certificate if one doesn't exist.
+      shell: "certbot certonly --standalone --noninteractive --agree-tos --email suliatoluwole97@gmail.com -d adefowokeoluwole.me"
+      with_items: "{{ letsencrypt_cert.results }}"
+      when: item.stat.exists == False
+
+    - name: Start apache services after cert. has been generated.
+      service:
+        name: apache2
+        state: started
+
+  handlers:
+    - name: Reload Apache2
+      service:
+        name: apache2
+        state: reloaded
+
+    - name: Restart Apache2
+      service:
+        name: apache2
+        state: restarted
+        
+    - name: Restart mariadb
+      service:
+        name: mariadb 
+        state: restarted
+        enabled: yes   
+
+    - name: Execute the script
+      command: bash ~/script/-postgresql.sh
